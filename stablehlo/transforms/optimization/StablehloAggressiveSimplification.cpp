@@ -69,20 +69,18 @@ static bool isIotaRange(ArrayRef<int64_t> dims) {
   });
 }
 
-bool mergeDiscardableAttributes(Value sourceValue, Value destValue) {
-  Operation* sourceOp = sourceValue.getDefiningOp();
-  Operation* destOp = destValue.getDefiningOp();
-  if (!sourceOp || !destOp) return false;
-
-  auto sourceAttrs = sourceOp->getDiscardableAttrDictionary();
-  if (!sourceAttrs) return true;
-
+// Merge `sourceAttrs` into `destOp`'s discardable attribute dictionary, with
+// source-wins semantics for top-level attribute keys and a field-by-field
+// merge for `mhlo.frontend_attributes` (which is itself a DictionaryAttr).
+// Existing discardable attrs on `destOp` that don't appear in `sourceAttrs`
+// are preserved.
+void mergeDiscardableAttrsInto(Operation* destOp, DictionaryAttr sourceAttrs) {
+  if (!sourceAttrs || sourceAttrs.empty()) return;
   auto destAttrs = destOp->getDiscardableAttrDictionary();
-  if (!destAttrs) {
+  if (!destAttrs || destAttrs.empty()) {
     destOp->setDiscardableAttrs(sourceAttrs);
-    return true;
+    return;
   }
-
   NamedAttrList mergedAttrs(destAttrs);
   for (auto attr : sourceAttrs.getValue()) {
     if (attr.getName() == "mhlo.frontend_attributes" &&
@@ -102,9 +100,56 @@ bool mergeDiscardableAttributes(Value sourceValue, Value destValue) {
       mergedAttrs.set(attr.getName(), attr.getValue());
     }
   }
-
   destOp->setDiscardableAttrs(mergedAttrs.getDictionary(destOp->getContext()));
+}
+
+bool mergeDiscardableAttributes(Value sourceValue, Value destValue) {
+  Operation* sourceOp = sourceValue.getDefiningOp();
+  Operation* destOp = destValue.getDefiningOp();
+  if (!sourceOp || !destOp) return false;
+  mergeDiscardableAttrsInto(destOp, sourceOp->getDiscardableAttrDictionary());
   return true;
+}
+
+// Wrapper around `rewriter.replaceOpWithNewOp<NewOpT>(op, args...)` that
+// merges the original op's discardable attributes into the new op.
+//
+// MLIR's `replaceOpWithNewOp` builds a fresh op from `args` and erases the
+// old one without carrying any of its attributes across. That silently drops
+// `mhlo.frontend_attributes` (and anything else stored as a discardable
+// attribute), which downstream consumers of this IR rely on. The most
+// painful instance is `_xla_compute_type=host`: when a simplification
+// pattern rewrites an op inside a `compute_on('device_host')` region, losing
+// the tag fragments the host-offload region. The host_execute boundary then
+// cuts through the WHILE op, and at runtime the host_execute returns just
+// the surviving prefix while its declared signature is the full while-tuple.
+//
+// Use this only for **clean 1:1 substitutions** — patterns where a single new
+// op stands in for a single old op and represents the same logical operation.
+// Two shapes of pattern are deliberately *not* covered:
+//
+//  1. Decomposition patterns that create intermediate ops via `Op::create`
+//     before calling `replaceOpWithNewOp` for the final result. The
+//     intermediates would still be attribute-less, so the host region would
+//     fragment around them — silently, which is worse than not fixing it.
+//     Those patterns continue to use bare `rewriter.replaceOpWithNewOp` and
+//     need their own per-pattern fix that tags every created op.
+//
+//  2. `replaceOp(op, vals)` where `vals` come from pre-existing producers in
+//     the graph. Retroactively writing attrs onto producers shared with other
+//     users is not always correct.
+//
+// The merge is field-aware: `mhlo.frontend_attributes` (a DictionaryAttr) is
+// merged key-by-key rather than overwritten, so any attrs already on the
+// freshly-built op are preserved alongside the source's.
+template <typename NewOpT, typename... Args>
+NewOpT replaceOpWithNewOpKeepAttrs(PatternRewriter& rewriter, Operation* op,
+                                   Args&&... args) {
+  DictionaryAttr sourceAttrs = op->getDiscardableAttrDictionary();
+  NewOpT newOp =
+      rewriter.replaceOpWithNewOp<NewOpT>(op, std::forward<Args>(args)...);
+  mergeDiscardableAttrsInto(newOp.getOperation(), sourceAttrs);
+  return newOp;
 }
 
 template <typename OpType>
@@ -207,15 +252,16 @@ struct CompareOpCanon final : SimplifyOpRewritePattern<CompareOp> {
         case ComparisonDirection::EQ:
         case ComparisonDirection::GE:
         case ComparisonDirection::LE: {
-          rewriter.replaceOpWithNewOp<ConstantOp>(
-              op, SplatElementsAttr::get(type, rewriter.getBoolAttr(true)));
+          replaceOpWithNewOpKeepAttrs<ConstantOp>(
+              rewriter, op,
+              SplatElementsAttr::get(type, rewriter.getBoolAttr(true)));
           return success();
         }
         case ComparisonDirection::GT:
         case ComparisonDirection::LT:
         case ComparisonDirection::NE: {
-          rewriter.replaceOpWithNewOp<ConstantOp>(op,
-                                                  rewriter.getZeroAttr(type));
+          replaceOpWithNewOpKeepAttrs<ConstantOp>(
+              rewriter, op, rewriter.getZeroAttr(type));
           return success();
         }
       }
@@ -436,8 +482,8 @@ struct DynamicBroadcastInDimOpNotActuallyDynamic final
     RankedTensorType type = op.getType();
     // output has static shape, replace with broadcast_in_dim
     if (type.hasStaticShape()) {
-      rewriter.replaceOpWithNewOp<BroadcastInDimOp>(
-          op, type, op.getOperand(), op.getBroadcastDimensionsAttr());
+      replaceOpWithNewOpKeepAttrs<BroadcastInDimOp>(
+          rewriter, op, type, op.getOperand(), op.getBroadcastDimensionsAttr());
       return success();
     }
 
@@ -481,7 +527,7 @@ struct DynamicIotaIsStatic : public SimplifyOpRewritePattern<DynamicIotaOp> {
     auto resultTy = cast<ShapedType>(iota.getType());
     if (!resultTy.hasStaticShape())
       return rewriter.notifyMatchFailure(iota, "requires output static shape");
-    rewriter.replaceOpWithNewOp<IotaOp>(iota, resultTy,
+    replaceOpWithNewOpKeepAttrs<IotaOp>(rewriter, iota, resultTy,
                                         iota.getIotaDimension());
     return success();
   }
@@ -530,6 +576,11 @@ struct DynamicIotaOpToBroadcast
         DynamicIotaOp::create(rewriter, iotaLoc, preBroadcastResultType,
                               iotaDimensionSize, rewriter.getI64IntegerAttr(0));
 
+    // Decomposition pattern: emits intermediate ConvertOp/SliceOp/
+    // DynamicIotaOp before this final op. replaceOpWithNewOpKeepAttrs would
+    // tag only the final op and silently fragment any host region around the
+    // intermediates, so we use bare replaceOpWithNewOp here. A correct fix
+    // for this pattern needs to tag every created intermediate.
     rewriter.replaceOpWithNewOp<DynamicBroadcastInDimOp>(
         iota, resultType, preBroadcastResult, iotaShape,
         rewriter.getDenseI64ArrayAttr(iotaDimension));
@@ -552,7 +603,7 @@ struct DynamicReshapeOpIsStatic final
     if (!type.hasStaticShape())
       return rewriter.notifyMatchFailure(op, "dynamic reshape not static");
 
-    rewriter.replaceOpWithNewOp<ReshapeOp>(op, type, op.getOperand());
+    replaceOpWithNewOpKeepAttrs<ReshapeOp>(rewriter, op, type, op.getOperand());
     return success();
   }
 };
@@ -637,8 +688,9 @@ struct DynamicSliceOpToSlice : public SimplifyOpRewritePattern<DynamicSliceOp> {
     auto sliceStrides = rewriter.getDenseI64ArrayAttr(
         SmallVector<int64_t, 4>(inputType.getRank(), 1));
 
-    rewriter.replaceOpWithNewOp<SliceOp>(dynamicSlice, input, sliceStartIndices,
-                                         sliceLimits, sliceStrides);
+    replaceOpWithNewOpKeepAttrs<SliceOp>(rewriter, dynamicSlice, input,
+                                         sliceStartIndices, sliceLimits,
+                                         sliceStrides);
     return success();
   }
 };
@@ -705,6 +757,10 @@ struct RealDynamicSliceOpToDynamicSlice
       startIndices.push_back(startIndex0D);
     }
 
+    // Decomposition pattern: emits one SliceOp + ReshapeOp per start-index
+    // dimension above. replaceOpWithNewOpKeepAttrs would tag only the final
+    // DynamicSliceOp and leave the SliceOp/ReshapeOp intermediates untagged,
+    // fragmenting any host region around them.
     rewriter.replaceOpWithNewOp<DynamicSliceOp>(
         op, op.getOperand(), startIndices,
         rewriter.getDenseI64ArrayAttr(sliceSizes));
@@ -910,8 +966,8 @@ struct GetDimensionSizeOpCanon final
 
     auto elemTy = cast<IntegerType>(op.getType().getElementType());
     IntegerAttr elemVal = rewriter.getIntegerAttr(elemTy, dimSize);
-    rewriter.replaceOpWithNewOp<ConstantOp>(
-        op, DenseElementsAttr::get(op.getType(), elemVal));
+    replaceOpWithNewOpKeepAttrs<ConstantOp>(
+        rewriter, op, DenseElementsAttr::get(op.getType(), elemVal));
     return success();
   }
 };
@@ -1017,6 +1073,9 @@ struct IotaOpBroadcast : public SimplifyOpRewritePattern<IotaOp> {
 
     auto broadcastAttr =
         rewriter.getDenseI64ArrayAttr({static_cast<int64_t>(iotaDim)});
+    // Decomposition pattern: emits an intermediate IotaOp before this final
+    // BroadcastInDimOp. replaceOpWithNewOpKeepAttrs would tag only the
+    // broadcast and fragment any host region around the intermediate iota.
     rewriter.replaceOpWithNewOp<BroadcastInDimOp>(iota, resultTy, iota1D,
                                                   broadcastAttr);
     return success();
@@ -1054,8 +1113,8 @@ struct PadOpBroadcastEmptyTensor : public SimplifyOpRewritePattern<PadOp> {
       return rewriter.notifyMatchFailure(op, "operand is not empty tensor");
 
     if (resultTy.hasStaticShape()) {
-      rewriter.replaceOpWithNewOp<BroadcastInDimOp>(
-          op, resultTy, padVal, rewriter.getDenseI64ArrayAttr({}));
+      replaceOpWithNewOpKeepAttrs<BroadcastInDimOp>(
+          rewriter, op, resultTy, padVal, rewriter.getDenseI64ArrayAttr({}));
       return success();
     }
 
@@ -1064,8 +1123,8 @@ struct PadOpBroadcastEmptyTensor : public SimplifyOpRewritePattern<PadOp> {
                                         reifiedShapes)))
       return rewriter.notifyMatchFailure(op, "failed to reify return type");
 
-    rewriter.replaceOpWithNewOp<DynamicBroadcastInDimOp>(
-        op, op.getType(), padVal, reifiedShapes.front(),
+    replaceOpWithNewOpKeepAttrs<DynamicBroadcastInDimOp>(
+        rewriter, op, op.getType(), padVal, reifiedShapes.front(),
         rewriter.getDenseI64ArrayAttr({}));
     return success();
   }
@@ -1120,8 +1179,8 @@ struct SelectOpCanon final : SimplifyOpRewritePattern<SelectOp> {
       newValues.push_back(condElem ? trueElem : falseElem);
     }
 
-    rewriter.replaceOpWithNewOp<ConstantOp>(
-        op, DenseElementsAttr::get(type, newValues));
+    replaceOpWithNewOpKeepAttrs<ConstantOp>(
+        rewriter, op, DenseElementsAttr::get(type, newValues));
     return success();
   }
 };
@@ -1156,12 +1215,12 @@ struct CompareSelectIntoMinMax final : SimplifyOpRewritePattern<SelectOp> {
     switch (direction) {
       case ComparisonDirection::GE:
       case ComparisonDirection::GT: {
-        rewriter.replaceOpWithNewOp<MaxOp>(op, trueVal, falseVal);
+        replaceOpWithNewOpKeepAttrs<MaxOp>(rewriter, op, trueVal, falseVal);
         return success();
       }
       case ComparisonDirection::LE:
       case ComparisonDirection::LT: {
-        rewriter.replaceOpWithNewOp<MinOp>(op, trueVal, falseVal);
+        replaceOpWithNewOpKeepAttrs<MinOp>(rewriter, op, trueVal, falseVal);
         return success();
       }
       default: {
@@ -1260,6 +1319,9 @@ struct SliceOpConcatSimplify : public SimplifyOpRewritePattern<SliceOp> {
     newStart[dimension] -= frontOffset;
     newLimit[dimension] -= frontOffset;
 
+    // Decomposition pattern: emits an intermediate ConcatenateOp before this
+    // final SliceOp. replaceOpWithNewOpKeepAttrs would tag only the slice
+    // and fragment any host region around the intermediate concat.
     rewriter.replaceOpWithNewOp<SliceOp>(
         slice, newConcat, rewriter.getDenseI64ArrayAttr(newStart),
         rewriter.getDenseI64ArrayAttr(newLimit), slice.getStrides());
@@ -1386,7 +1448,7 @@ struct TransposeIsReshape final : SimplifyOpRewritePattern<TransposeOp> {
       if (nonZeroPerms[i - 1] > nonZeroPerms[i])
         return rewriter.notifyMatchFailure(op, "memory layout change");
 
-    rewriter.replaceOpWithNewOp<ReshapeOp>(op, op.getType(), input);
+    replaceOpWithNewOpKeepAttrs<ReshapeOp>(rewriter, op, op.getType(), input);
     return success();
   }
 };
